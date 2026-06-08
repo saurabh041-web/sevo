@@ -9,7 +9,7 @@
 const CONFIG = {
   groqKey: localStorage.getItem('groq_key') || '',
   assistantName: localStorage.getItem('assistant_name') || 'SEVO',
-  vercelUrl: 'https://sevo-one.vercel.app',
+  vercelUrl: 'https://sevo-backend.onrender.com',
   elevenLabsVoice: '21m00Tcm4TlvDq8ikWAM',
   city: 'Siliguri',
   groqModel: 'llama-3.3-70b-versatile',
