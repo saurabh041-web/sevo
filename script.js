@@ -7,9 +7,8 @@
 
 // ─── CORE CONFIG ────────────────────────────────────────────
 const CONFIG = {
-  groqKey: localStorage.getItem('groq_key') || '',
   assistantName: localStorage.getItem('assistant_name') || 'SEVO',
-  vercelUrl: 'https://sevo-one.vercel.app',
+  vercelUrl: 'https://sevo-backend.onrender.com',
   elevenLabsVoice: '21m00Tcm4TlvDq8ikWAM',
   city: 'Siliguri',
   groqModel: 'llama-3.3-70b-versatile',
@@ -57,29 +56,57 @@ function detectMood(text) {
 
 // ============================================================
 // AGENT 1 — MEMORY AGENT
-// Only agent allowed to touch conversation or smart memory.
-// Everyone else asks MemoryAgent for context.
+// Conversation history + smart memory — both backed by Supabase.
+// localStorage used as fast cache / offline fallback.
 // ============================================================
 const MemoryAgent = {
-  conversation: JSON.parse(localStorage.getItem('sevo_memory') || '[]'),
+  conversation: [],
+  smartMemoryCache: '',
+  sessionId: `session_${new Date().toISOString().split('T')[0]}_sevo`,
 
+  // ── Load conversation from Supabase (falls back to localStorage) ──
   async load() {
-    if (window.electronAPI) {
-      const saved = await window.electronAPI.loadMemory();
-      if (saved && saved.length > 0) this.conversation = saved;
-    }
+    try {
+      const res = await fetch(`${CONFIG.vercelUrl}/api/conversation/${this.sessionId}`);
+      const data = await res.json();
+      if (Array.isArray(data) && data.length > 0) {
+        this.conversation = data.map(m => ({ role: m.role, content: m.content }));
+        return this.conversation;
+      }
+    } catch(e) {}
+    this.conversation = JSON.parse(localStorage.getItem('sevo_memory') || '[]');
     return this.conversation;
   },
 
-  async save() {
-    if (window.electronAPI) await window.electronAPI.saveMemory(this.conversation);
-    else localStorage.setItem('sevo_memory', JSON.stringify(this.conversation));
+  // ── Load smart memory from Supabase (falls back to localStorage) ──
+  async loadSmartMemory() {
+    try {
+      const res = await fetch(`${CONFIG.vercelUrl}/api/memory/smart_memory`);
+      const data = await res.json();
+      if (Array.isArray(data) && data.length > 0) {
+        this.smartMemoryCache = data[data.length - 1].content;
+        localStorage.setItem('sevo_smart_memory', this.smartMemoryCache);
+        return;
+      }
+    } catch(e) {}
+    this.smartMemoryCache = localStorage.getItem('sevo_smart_memory') || '';
   },
 
-  push(role, content) {
+  // ── Push message to local array + Supabase ──
+  async push(role, content) {
     this.conversation.push({ role, content });
-    // Keep last 40 messages to avoid token overflow
     if (this.conversation.length > 40) this.conversation = this.conversation.slice(-40);
+    localStorage.setItem('sevo_memory', JSON.stringify(this.conversation));
+    // Fire-and-forget to Supabase
+    fetch(`${CONFIG.vercelUrl}/api/conversation`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ session_id: this.sessionId, role, content })
+    }).catch(() => {});
+  },
+
+  async save() {
+    localStorage.setItem('sevo_memory', JSON.stringify(this.conversation));
   },
 
   getRecent(n = 20) {
@@ -87,21 +114,18 @@ const MemoryAgent = {
   },
 
   getSmartMemory() {
-    return localStorage.getItem('sevo_smart_memory') || '';
+    return this.smartMemoryCache || localStorage.getItem('sevo_smart_memory') || '';
   },
 
+  // ── Update smart memory via backend, save to Supabase ──
   async updateSmartMemory(userMessage, aiReply) {
     try {
       const existing = this.getSmartMemory();
-      const res = await fetch('https://api.groq.com/openai/v1/chat/completions', {
+      const res = await fetch(`${CONFIG.vercelUrl}/api/chat`, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${CONFIG.groqKey}` },
+        headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          model: CONFIG.groqModel,
-          max_tokens: 500,
-          messages: [{
-            role: 'system',
-            content: `You are SEVO's memory manager. Maintain a permanent, organized memory about ${USER_PROFILE.fullName} (goes by ${USER_PROFILE.nickname}).
+          system: `You are SEVO's memory manager. Maintain a permanent, organized memory about ${USER_PROFILE.fullName} (goes by ${USER_PROFILE.nickname}).
 RULES:
 - NEVER delete existing memories unless ${USER_PROFILE.nickname} explicitly says to forget something
 - ALWAYS append new important information
@@ -116,26 +140,34 @@ New conversation:
 User: ${userMessage}
 SEVO: ${aiReply}
 
-Return the COMPLETE updated memory.`
-          }]
+Return the COMPLETE updated memory.`,
+          messages: [{ role: 'user', content: 'Update memory now' }]
         })
       });
       const data = await res.json();
-      localStorage.setItem('sevo_smart_memory', data.choices[0].message.content);
+      const newMemory = data.choices[0].message.content;
+      this.smartMemoryCache = newMemory;
+      localStorage.setItem('sevo_smart_memory', newMemory);
+      // Save to Supabase (fire-and-forget)
+      fetch(`${CONFIG.vercelUrl}/api/memory`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ category: 'smart_memory', content: newMemory })
+      }).catch(() => {});
     } catch(e) {}
   },
 
   clear() {
     this.conversation = [];
-    if (window.electronAPI) window.electronAPI.saveMemory([]);
-    else localStorage.removeItem('sevo_memory');
+    this.smartMemoryCache = '';
+    localStorage.removeItem('sevo_memory');
+    fetch(`${CONFIG.vercelUrl}/api/conversation/${this.sessionId}`, { method: 'DELETE' }).catch(() => {});
   }
 };
 
 
 // ============================================================
 // AGENT 2 — SEARCH AGENT
-// One job: search the web. Returns raw results as a string.
 // ============================================================
 const SearchAgent = {
   async search(query) {
@@ -157,7 +189,6 @@ const SearchAgent = {
 
 // ============================================================
 // AGENT 3 — YOUTUBE AGENT
-// One job: find and play YouTube videos.
 // ============================================================
 const YouTubeAgent = {
   async search(query) {
@@ -191,8 +222,6 @@ const YouTubeAgent = {
 
 // ============================================================
 // AGENT 4 — PC AGENT
-// One job: control the computer. Uses Groq to detect which
-// tools to run, then runs them.
 // ============================================================
 const PCAgent = {
   tools: {
@@ -233,19 +262,15 @@ const PCAgent = {
 
   async execute(text) {
     try {
-      const res = await fetch('https://api.groq.com/openai/v1/chat/completions', {
+      const res = await fetch(`${CONFIG.vercelUrl}/api/chat`, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${CONFIG.groqKey}` },
+        headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          model: CONFIG.groqModel,
-          max_tokens: 200,
-          messages: [{
-            role: 'system',
-            content: `You are a PC tool detector. Respond with ONLY a JSON array of actions like:
+          system: `You are a PC tool detector. Respond with ONLY a JSON array of actions like:
 [{"tool": "open_youtube"}, {"tool": "search_youtube", "query": "lofi beats"}]
 Available tools: open_youtube, open_google, open_spotify, open_whatsapp, open_instagram, open_gmail, search_youtube, search_google, play_music, open_notepad, open_calculator, open_explorer, shutdown, restart, cancel_shutdown, take_screenshot, system_info, volume_up, volume_down, mute.
-If no tool matches, respond with [{"tool": "none"}].`
-          }, { role: 'user', content: text }]
+If no tool matches, respond with [{"tool": "none"}].`,
+          messages: [{ role: 'user', content: text }]
         })
       });
       const data = await res.json();
@@ -268,8 +293,7 @@ If no tool matches, respond with [{"tool": "none"}].`
 
 // ============================================================
 // AGENT 5 — CHAT AGENT
-// One job: talk to Groq and respond with full personality.
-// Always gets memory context from MemoryAgent before responding.
+// All Groq calls go through the secure backend — no API key in frontend.
 // ============================================================
 const ChatAgent = {
   buildSystemPrompt(mood, searchContext = '') {
@@ -309,13 +333,12 @@ CAPABILITIES: You can control ${USER_PROFILE.nickname}'s PC — open apps, websi
     const mood = detectMood(userMessage);
     const systemPrompt = this.buildSystemPrompt(mood, searchContext);
 
-    const res = await fetch('https://api.groq.com/openai/v1/chat/completions', {
+    const res = await fetch(`${CONFIG.vercelUrl}/api/chat`, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${CONFIG.groqKey}` },
+      headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
-        model: CONFIG.groqModel,
-        messages: [{ role: 'system', content: systemPrompt }, ...MemoryAgent.getRecent(20)],
-        max_tokens: 1024
+        system: systemPrompt,
+        messages: MemoryAgent.getRecent(20)
       })
     });
     const data = await res.json();
@@ -327,7 +350,6 @@ CAPABILITIES: You can control ${USER_PROFILE.nickname}'s PC — open apps, websi
 
 // ============================================================
 // AGENT 6 — VOICE AGENT
-// One job: speak text. ElevenLabs first, Google TTS fallback.
 // ============================================================
 const VoiceAgent = {
   async speakElevenLabs(text) {
@@ -347,7 +369,10 @@ const VoiceAgent = {
           body: JSON.stringify({ text: clean })
         });
         if (!res.ok) throw new Error('ElevenLabs failed');
-        const blob = await res.blob();
+        // Backend returns base64 audio
+        const json = await res.json();
+        const audioBytes = Uint8Array.from(atob(json.audio), c => c.charCodeAt(0));
+        const blob = new Blob([audioBytes], { type: json.content_type });
         const audioUrl = URL.createObjectURL(blob);
         const audio = new Audio(audioUrl);
         audio.onplay = () => { document.getElementById('mainAvatar').classList.add('speaking'); UI.setStatus('speaking...'); };
@@ -388,23 +413,17 @@ const VoiceAgent = {
 
 
 // ============================================================
-// COORDINATOR — The boss. Reads intent, delegates to agents.
-// Can detect MULTIPLE intents in one message.
-// No agent talks to another without Coordinator knowing.
+// COORDINATOR — Routes intents to agents
 // ============================================================
 const Coordinator = {
 
   async classify(text) {
     try {
-      const res = await fetch('https://api.groq.com/openai/v1/chat/completions', {
+      const res = await fetch(`${CONFIG.vercelUrl}/api/chat`, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${CONFIG.groqKey}` },
+        headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          model: CONFIG.groqModel,
-          max_tokens: 20,
-          messages: [{
-            role: 'system',
-            content: `You are a message router. A message can have MULTIPLE intents. Respond with ONLY a comma-separated list of applicable categories, nothing else.
+          system: `You are a message router. A message can have MULTIPLE intents. Respond with ONLY a comma-separated list of applicable categories, nothing else.
 
 Categories:
 "chat" — general conversation, opinions, AI knowledge, questions Claude can answer
@@ -418,8 +437,9 @@ Examples:
 "open notepad" → pc
 "what is quantum computing" → chat
 "what's the weather and play lofi on youtube" → search,youtube
-"open spotify and tell me a joke" → pc,chat`
-          }, { role: 'user', content: text }]
+"open spotify and tell me a joke" → pc,chat
+"search latest AI news and open youtube" → search,pc`,
+          messages: [{ role: 'user', content: text }]
         })
       });
       const data = await res.json();
@@ -433,11 +453,8 @@ Examples:
     UI.setStatus('thinking...');
     const routes = await this.classify(text);
 
-    // Always save user message first
-    MemoryAgent.push('user', text);
-    await MemoryAgent.save();
+    await MemoryAgent.push('user', text);
 
-    // ── PURE PC (no chat needed) ──────────────────────────
     if (routes.length === 1 && routes[0] === 'pc') {
       UI.setStatus('executing...');
       const result = await PCAgent.execute(text);
@@ -449,7 +466,6 @@ Examples:
       return;
     }
 
-    // ── PURE YOUTUBE ──────────────────────────────────────
     if (routes.length === 1 && routes[0] === 'youtube') {
       UI.setStatus('searching YouTube...');
       const result = await YouTubeAgent.play(text);
@@ -461,19 +477,11 @@ Examples:
       return;
     }
 
-    // ── MULTI-INTENT or CHAT ──────────────────────────────
-    // Fire PC and YouTube in parallel while ChatAgent thinks
     let pcPromise = null;
     let ytPromise = null;
+    if (routes.includes('pc')) pcPromise = PCAgent.execute(text);
+    if (routes.includes('youtube')) ytPromise = YouTubeAgent.play(text);
 
-    if (routes.includes('pc')) {
-      pcPromise = PCAgent.execute(text);
-    }
-    if (routes.includes('youtube')) {
-      ytPromise = YouTubeAgent.play(text);
-    }
-
-    // Get search context if needed (feeds into ChatAgent)
     let searchContext = '';
     if (routes.includes('search')) {
       UI.setStatus('scanning web...');
@@ -481,7 +489,6 @@ Examples:
       if (results) searchContext = results;
     }
 
-    // ChatAgent always runs for chat/search/mixed intents
     UI.addTyping();
     UI.setStatus('processing...');
 
@@ -489,24 +496,19 @@ Examples:
       const reply = await ChatAgent.respond(text, searchContext);
       UI.removeTyping();
 
-      MemoryAgent.push('assistant', reply);
-      await MemoryAgent.save();
+      await MemoryAgent.push('assistant', reply);
 
       UI.addMessage('ai', reply);
       UI.playTypeSound();
       UI.setStatus('SYSTEM ONLINE');
       if (STATE.voiceOutput) VoiceAgent.speak(reply);
 
-      // Update smart memory in background — don't await
       MemoryAgent.updateSmartMemory(text, reply);
 
-      // Show PC result if it ran in parallel
       if (pcPromise) {
         const pcResult = await pcPromise;
         if (pcResult) UI.addMessage('ai', `⚡ ${pcResult}`);
       }
-
-      // Show YouTube result if it ran in parallel
       if (ytPromise) {
         const ytResult = await ytPromise;
         if (ytResult) UI.addMessage('ai', `⚡ ${ytResult}`);
@@ -522,7 +524,7 @@ Examples:
 
 
 // ============================================================
-// UI LAYER — All DOM operations live here. No agent touches DOM.
+// UI LAYER
 // ============================================================
 const UI = {
   setStatus(text) {
@@ -743,22 +745,18 @@ async function fetchNews() {
 
 
 // ============================================================
-// PROACTIVE GREETING — Fires on startup if smart memory exists
+// PROACTIVE GREETING
 // ============================================================
 async function proactiveGreeting() {
   const smartMemory = MemoryAgent.getSmartMemory();
   if (!smartMemory || MemoryAgent.conversation.length > 0) return;
   try {
-    const res = await fetch('https://api.groq.com/openai/v1/chat/completions', {
+    const res = await fetch(`${CONFIG.vercelUrl}/api/chat`, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${CONFIG.groqKey}` },
+      headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
-        model: CONFIG.groqModel,
-        max_tokens: 100,
-        messages: [{
-          role: 'system',
-          content: `You are SEVO, a personal AI assistant and possessive best friend of ${USER_PROFILE.nickname} (${USER_PROFILE.fullName}). Current date/time: ${getCurrentDateTime()}. Send ONE short proactive message to start the conversation — a reminder, check-in, or acknowledgment of something important. Under 2 sentences. Casual. Call him "Sevo" or "bro" naturally. Memory: ${smartMemory}`
-        }, { role: 'user', content: 'Start the conversation proactively' }]
+        system: `You are SEVO, a personal AI assistant and possessive best friend of ${USER_PROFILE.nickname} (${USER_PROFILE.fullName}). Current date/time: ${getCurrentDateTime()}. Send ONE short proactive message to start the conversation — a reminder, check-in, or acknowledgment of something important. Under 2 sentences. Casual. Call him "Sevo" or "bro" naturally. Memory: ${smartMemory}`,
+        messages: [{ role: 'user', content: 'Start the conversation proactively' }]
       })
     });
     const data = await res.json();
@@ -770,20 +768,18 @@ async function proactiveGreeting() {
 
 
 // ============================================================
-// UI HELPERS — Setup, input, clear
+// UI HELPERS
 // ============================================================
 function autoResize(el) { el.style.height = 'auto'; el.style.height = Math.min(el.scrollHeight, 120) + 'px'; }
 function handleKey(e) { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); sendMessage(); } }
 function sendSuggestion(el) { document.getElementById('userInput').value = el.textContent; sendMessage(); }
 
 function saveSetup() {
-  const key = document.getElementById('apiKeyInput').value.trim();
-  const name = document.getElementById('assistantName').value.trim();
-  if (!key) { alert('Please enter your API key!'); return; }
-  CONFIG.groqKey = key;
-  CONFIG.assistantName = name || 'SEVO';
-  localStorage.setItem('groq_key', CONFIG.groqKey);
-  localStorage.setItem('assistant_name', CONFIG.assistantName);
+  const name = document.getElementById('assistantName')?.value.trim();
+  if (name) {
+    CONFIG.assistantName = name;
+    localStorage.setItem('assistant_name', name);
+  }
   hideSetup();
   updateAssistantName();
   fetchNews();
@@ -792,7 +788,7 @@ function saveSetup() {
 }
 
 function hideSetup() { document.getElementById('setup').style.display = 'none'; updateAssistantName(); }
-function resetSetup() { localStorage.removeItem('groq_key'); localStorage.removeItem('assistant_name'); location.reload(); }
+function resetSetup() { localStorage.clear(); location.reload(); }
 
 function updateAssistantName() {
   document.getElementById('assistantTitle').textContent = CONFIG.assistantName.toUpperCase();
@@ -802,7 +798,7 @@ function updateAssistantName() {
 async function sendMessage() {
   const input = document.getElementById('userInput');
   const text = input.value.trim();
-  if (!text || !CONFIG.groqKey) return;
+  if (!text) return;
   input.value = '';
   input.style.height = 'auto';
   document.getElementById('sendBtn').disabled = true;
@@ -834,11 +830,17 @@ function clearChat() {
 // INIT — Boot sequence
 // ============================================================
 window.onload = async () => {
-  if (CONFIG.groqKey) { hideSetup(); updateAssistantName(); startWakeWord(); }
+  // No API key setup needed — everything runs through secure backend
+  hideSetup();
+  updateAssistantName();
+  startWakeWord();
   fetchWeather();
-  if (CONFIG.groqKey) { fetchNews(); setTimeout(proactiveGreeting, 3000); }
+  // Load smart memory from Supabase first, then conversation
+  await MemoryAgent.loadSmartMemory();
   const history = await MemoryAgent.load();
   if (history && history.length > 0) UI.loadChatHistory();
+  fetchNews();
+  setTimeout(proactiveGreeting, 3000);
 };
 
 if (window.speechSynthesis) { window.speechSynthesis.onvoiceschanged = () => window.speechSynthesis.getVoices(); }
