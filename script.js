@@ -1167,3 +1167,177 @@ async function keepAlive() {
   } catch(e) {}
 }
 setInterval(keepAlive, 480000); // every 8 minutes
+
+
+// ============================================================
+// BEAST MODE — STEP 1 + STEP 2
+// Agent output wrappers + runChain coordinator
+// Appended at end of file — all referenced agents/objects
+// (PCAgent, FileAgent, ClipboardAgent, ReminderAgent,
+// BatteryAgent, YouTubeAgent, ErrorAgent, Coordinator, UI,
+// STATE, VoiceAgent) are already declared above by this point.
+// ============================================================
+
+// ─── STEP 1: STANDARDIZED RESULT WRAPPERS ──────────────────
+// Every agent currently returns: string (success) | null (no match)
+// These wrappers convert that into: { success: boolean, message: string }
+// No agent internals are touched — just wrapping their existing output.
+
+const AgentWrappers = {
+  // PCAgent — supports DIRECT tool calls (no LLM classification)
+  async pc(toolName, args = {}) {
+    try {
+      const tool = PCAgent.tools[toolName];
+      if (!tool) {
+        return { success: false, message: `Unknown PC tool: "${toolName}"` };
+      }
+      const query = args.query || '';
+      const result = await tool(query);
+      if (result) return { success: true, message: result };
+      return { success: false, message: `PC tool "${toolName}" returned nothing` };
+    } catch (e) {
+      return { success: false, message: ErrorAgent.diagnose(e, 'PC') };
+    }
+  },
+
+  // FileAgent — no tool map yet, so we feed it a synthetic command string
+  async file(toolName, args = {}) {
+    try {
+      const text = args.text || toolName; // allow either {text: "..."} or fallback
+      const result = await FileAgent.execute(text);
+      if (result) return { success: true, message: result };
+      return { success: false, message: `File action produced no result for: "${text}"` };
+    } catch (e) {
+      return { success: false, message: ErrorAgent.diagnose(e, 'File') };
+    }
+  },
+
+  // ClipboardAgent — same synthetic-command approach
+  async clipboard(toolName, args = {}) {
+    try {
+      const text = args.text || toolName;
+      const result = await ClipboardAgent.execute(text);
+      if (result) return { success: true, message: result };
+      return { success: false, message: `Clipboard action produced no result for: "${text}"` };
+    } catch (e) {
+      return { success: false, message: ErrorAgent.diagnose(e, 'Clipboard') };
+    }
+  },
+
+  // ReminderAgent — same synthetic-command approach
+  async reminder(toolName, args = {}) {
+    try {
+      const text = args.text || toolName;
+      const result = await ReminderAgent.execute(text);
+      if (result) return { success: true, message: result };
+      return { success: false, message: `Reminder action produced no result for: "${text}"` };
+    } catch (e) {
+      return { success: false, message: ErrorAgent.diagnose(e, 'Reminder') };
+    }
+  },
+
+  // BatteryAgent — same synthetic-command approach
+  async battery(toolName, args = {}) {
+    try {
+      const text = args.text || toolName || 'battery';
+      const result = await BatteryAgent.execute(text);
+      if (result) return { success: true, message: result };
+      return { success: false, message: `Battery check produced no result` };
+    } catch (e) {
+      return { success: false, message: ErrorAgent.diagnose(e, 'Battery') };
+    }
+  },
+
+  // YouTubeAgent — wraps .play()
+  async youtube(toolName, args = {}) {
+    try {
+      const text = args.text || `play ${args.query || toolName}`;
+      const result = await YouTubeAgent.play(text);
+      if (result) return { success: true, message: result };
+      return { success: false, message: `YouTube search returned nothing` };
+    } catch (e) {
+      return { success: false, message: ErrorAgent.diagnose(e, 'YouTube') };
+    }
+  }
+};
+
+
+// ─── STEP 2: RUNCHAIN COORDINATOR ──────────────────────────
+// Sequential executor for structured multi-step chains.
+//
+// Step format:
+//   { agent: "pc", tool: "open_vscode" }
+//   { agent: "pc", tool: "search_youtube", args: { query: "lofi beats" } }
+//   { agent: "file", tool: "create file called notes.txt" }   // synthetic text for non-PC agents
+//   { agent: "reminder", tool: "remind me to eat at 7pm" }
+//
+// Behavior:
+//   - Runs steps in order, one at a time (awaits each).
+//   - On first failure, STOPS the chain (no silent continuation).
+//   - Returns a full log of every step's result, so you can see
+//     exactly what happened, including the success/fail point.
+
+Coordinator.runChain = async function(steps) {
+  const log = [];
+
+  if (!Array.isArray(steps) || steps.length === 0) {
+    return { completed: false, stoppedAt: -1, log: [], message: 'No steps provided' };
+  }
+
+  for (let i = 0; i < steps.length; i++) {
+    const step = steps[i];
+    const agentName = (step.agent || '').toLowerCase();
+    const toolName = step.tool || '';
+    const args = step.args || {};
+
+    const wrapper = AgentWrappers[agentName];
+    if (!wrapper) {
+      const result = { success: false, message: `Unknown agent: "${step.agent}"` };
+      log.push({ step: i, ...step, result });
+      return { completed: false, stoppedAt: i, log, message: result.message };
+    }
+
+    UI.setStatus(`step ${i + 1}/${steps.length}: ${agentName}.${toolName}`);
+    const result = await wrapper(toolName, args);
+    log.push({ step: i, ...step, result });
+
+    // Report each step's outcome live in chat
+    const icon = result.success ? '✅' : '❌';
+    UI.addMessage('ai', `${icon} Step ${i + 1}: ${result.message}`);
+
+    if (!result.success) {
+      UI.setStatus('SYSTEM ONLINE');
+      if (STATE.voiceOutput) VoiceAgent.speak(`Chain stopped at step ${i + 1}: ${result.message}`);
+      return { completed: false, stoppedAt: i, log, message: `Chain stopped at step ${i + 1}` };
+    }
+  }
+
+  UI.setStatus('SYSTEM ONLINE');
+  if (STATE.voiceOutput) VoiceAgent.speak(`Chain complete — all ${steps.length} steps done`);
+  return { completed: true, stoppedAt: -1, log, message: `All ${steps.length} steps completed` };
+};
+
+
+// ============================================================
+// MANUAL TEST EXAMPLES — run these from browser console
+// to verify before wiring up the LLM planner
+// ============================================================
+//
+// Example 1: open VS Code, then open GitHub
+// Coordinator.runChain([
+//   { agent: "pc", tool: "open_vscode" },
+//   { agent: "pc", tool: "open_github" }
+// ]);
+//
+// Example 2: search YouTube, then check battery
+// Coordinator.runChain([
+//   { agent: "pc", tool: "search_youtube", args: { query: "lofi beats" } },
+//   { agent: "battery", tool: "battery" }
+// ]);
+//
+// Example 3: failure test — unknown tool should stop the chain
+// Coordinator.runChain([
+//   { agent: "pc", tool: "open_vscode" },
+//   { agent: "pc", tool: "does_not_exist" },
+//   { agent: "pc", tool: "open_chrome" }  // should NOT run
+// ]);
