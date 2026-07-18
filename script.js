@@ -713,33 +713,7 @@ const MusicAgent = {
   },
 
   async focusVideoAndToggle() {
-    const script = `
-Add-Type -AssemblyName System.Windows.Forms
-Add-Type @"
-using System;
-using System.Runtime.InteropServices;
-public class Win32Click {
-  [DllImport("user32.dll")] public static extern bool GetWindowRect(IntPtr hWnd, out RECT rect);
-  [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();
-  [DllImport("user32.dll")] public static extern void mouse_event(uint dwFlags, uint dx, uint dy, uint dwData, int dwExtraInfo);
-  public struct RECT { public int Left; public int Top; public int Right; public int Bottom; }
-}
-"@
- $wsh = New-Object -ComObject WScript.Shell
- $wsh.AppActivate('chrome')
-Start-Sleep -Milliseconds 200
- $hwnd = [Win32Click]::GetForegroundWindow()
- $rect = New-Object Win32Click+RECT
-[Win32Click]::GetWindowRect($hwnd, [ref]$rect)
- $centerX = [int](($rect.Left + $rect.Right) / 2)
- $centerY = [int](($rect.Top + $rect.Bottom) / 2)
-[System.Windows.Forms.Cursor]::Position = New-Object System.Drawing.Point($centerX, $centerY)
-[Win32Click]::mouse_event(0x0002, 0, 0, 0, 0)
-Start-Sleep -Milliseconds 50
-[Win32Click]::mouse_event(0x0004, 0, 0, 0, 0)
-Start-Sleep -Milliseconds 100
- $wsh.SendKeys(' ')
-`.replace(/\r?\n/g, ' ');
+    const script = "$q = [char]34; $sig = 'public struct RECT { public int Left; public int Top; public int Right; public int Bottom; } [DllImport(' + $q + 'user32.dll' + $q + ')] public static extern bool GetWindowRect(IntPtr hWnd, out RECT rect); [DllImport(' + $q + 'user32.dll' + $q + ')] public static extern IntPtr GetForegroundWindow(); [DllImport(' + $q + 'user32.dll' + $q + ')] public static extern void mouse_event(uint dwFlags, uint dx, uint dy, uint dwData, int dwExtraInfo);'; Add-Type -MemberDefinition $sig -Name Win32Click -Namespace SevoNative; Add-Type -AssemblyName System.Windows.Forms; $wsh = New-Object -ComObject WScript.Shell; $wsh.AppActivate('chrome'); Start-Sleep -Milliseconds 300; $hwnd = [SevoNative.Win32Click]::GetForegroundWindow(); $rect = New-Object SevoNative.Win32Click+RECT; [SevoNative.Win32Click]::GetWindowRect($hwnd, [ref]$rect); $centerX = [int](($rect.Left + $rect.Right) / 2); $centerY = [int](($rect.Top + $rect.Bottom) / 2); [System.Windows.Forms.Cursor]::Position = New-Object System.Drawing.Point($centerX, $centerY); [SevoNative.Win32Click]::mouse_event(0x0002, 0, 0, 0, 0); Start-Sleep -Milliseconds 50; [SevoNative.Win32Click]::mouse_event(0x0004, 0, 0, 0, 0); Start-Sleep -Milliseconds 100; $wsh.SendKeys(' ')";
     await window.electronAPI?.runPC(`powershell -c "${script}"`);
   },
 
