@@ -712,12 +712,43 @@ const MusicAgent = {
     }
   },
 
+  async focusVideoAndToggle() {
+    const script = `
+Add-Type -AssemblyName System.Windows.Forms
+Add-Type @"
+using System;
+using System.Runtime.InteropServices;
+public class Win32Click {
+  [DllImport("user32.dll")] public static extern bool GetWindowRect(IntPtr hWnd, out RECT rect);
+  [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();
+  [DllImport("user32.dll")] public static extern void mouse_event(uint dwFlags, uint dx, uint dy, uint dwData, int dwExtraInfo);
+  public struct RECT { public int Left; public int Top; public int Right; public int Bottom; }
+}
+"@
+ $wsh = New-Object -ComObject WScript.Shell
+ $wsh.AppActivate('chrome')
+Start-Sleep -Milliseconds 200
+ $hwnd = [Win32Click]::GetForegroundWindow()
+ $rect = New-Object Win32Click+RECT
+[Win32Click]::GetWindowRect($hwnd, [ref]$rect)
+ $centerX = [int](($rect.Left + $rect.Right) / 2)
+ $centerY = [int](($rect.Top + $rect.Bottom) / 2)
+[System.Windows.Forms.Cursor]::Position = New-Object System.Drawing.Point($centerX, $centerY)
+[Win32Click]::mouse_event(0x0002, 0, 0, 0, 0)
+Start-Sleep -Milliseconds 50
+[Win32Click]::mouse_event(0x0004, 0, 0, 0, 0)
+Start-Sleep -Milliseconds 100
+ $wsh.SendKeys(' ')
+`.replace(/\r?\n/g, ' ');
+    await window.electronAPI?.runPC(`powershell -c "${script}"`);
+  },
+
   async pause() {
     if (!this.queue.hasTabOpen) {
       return "Nothing is playing right now, buddy. You might need to pause it manually if a tab is open.";
     }
     try {
-      await window.electronAPI?.runPC(`powershell -c "$wsh = New-Object -ComObject WScript.Shell; $wsh.AppActivate('chrome'); Start-Sleep -Milliseconds 200; $wsh.SendKeys(' ')"`);
+      await this.focusVideoAndToggle();
       return 'Paused ⏸️';
     } catch (e) {
       return "Couldn't pause automatically. You might need to hit space manually.";
@@ -729,7 +760,7 @@ const MusicAgent = {
       return "Nothing is playing right now, buddy.";
     }
     try {
-      await window.electronAPI?.runPC(`powershell -c "$wsh = New-Object -ComObject WScript.Shell; $wsh.AppActivate('chrome'); Start-Sleep -Milliseconds 200; $wsh.SendKeys(' ')"`);
+      await this.focusVideoAndToggle();
       return 'Resumed ▶️';
     } catch (e) {
       return "Couldn't resume automatically. You might need to hit space manually.";
