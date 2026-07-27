@@ -35,6 +35,10 @@ const STATE = {
   reminders: JSON.parse(localStorage.getItem('sevo_reminders') || '[]'),
   currentMood: 'neutral',
   moodOverridden: false,
+  absenceTier: 'none',
+  hoursSinceLastSession: null,
+  previousEmotionalSummary: null,
+  previousKeyTopics: null,
 };
 
 // ─── UTILS ──────────────────────────────────────────────────
@@ -52,6 +56,7 @@ async function detectMood(text) {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
+        call_type: 'utility',
         system: `You are an emotional state classifier. Classify the user's message into exactly ONE of these six states:
 stressed — overwhelmed, anxious, under pressure, too much going on
 hyped — excited, energetic, celebrating, motivated
@@ -159,6 +164,7 @@ const MemoryAgent = {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
+          call_type: 'utility',
           system: `You are SEVO's memory manager. Maintain a permanent, organized memory about ${USER_PROFILE.fullName} (goes by ${USER_PROFILE.nickname}).
 RULES:
 - NEVER delete existing memories unless ${USER_PROFILE.nickname} explicitly says to forget something
@@ -206,6 +212,7 @@ Return the COMPLETE updated memory.`,
 const MoodAgent = {
   sessionMoods: [],
   checkInFired: false,
+  awaitingCheckInResponse: false,
 
   trackMood(mood) {
     this.sessionMoods.push(mood);
@@ -218,20 +225,83 @@ const MoodAgent = {
     return Object.entries(counts).sort((a, b) => b[1] - a[1])[0][0];
   },
 
+  async generateSessionSummary() {
+    if (MemoryAgent.conversation.length < 4) return null;
+    try {
+      const transcript = MemoryAgent.conversation.map(m => `${m.role}: ${m.content}`).join('\n');
+      const res = await fetch(`${CONFIG.vercelUrl}/api/chat`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          call_type: 'utility',
+          system: `Analyze this conversation and produce a summary. Format EXACTLY as two labeled lines. No markdown, no extra text.
+SUMMARY: [2-3 sentences capturing the emotional tone and what mattered most]
+TOPICS: [Comma-separated list of specific topics, tasks, or open questions]`,
+          messages: [{ role: 'user', content: transcript }]
+        })
+      });
+      const data = await res.json();
+      const raw = parseBackendResponse(data);
+      if (!raw) return null;
+      
+      const summaryMatch = raw.match(/SUMMARY:\s*(.*)/i);
+      const topicsMatch = raw.match(/TOPICS:\s*(.*)/i);
+      
+      if (summaryMatch && topicsMatch) {
+        return {
+          emotional_summary: summaryMatch[1].trim(),
+          key_topics: topicsMatch[1].trim()
+        };
+      }
+      return null;
+    } catch(e) {
+      return null;
+    }
+  },
+
   async saveSession() {
     const dominant = this.getDominantMood();
     const today = new Date().toISOString().split('T')[0];
+    const summaryData = await this.generateSessionSummary();
+    
+    const payload = {
+      session_id: MemoryAgent.sessionId,
+      date: today,
+      dominant_mood: dominant
+    };
+    
+    if (summaryData) {
+      payload.emotional_summary = summaryData.emotional_summary;
+      payload.key_topics = summaryData.key_topics;
+    }
+    
     try {
       await fetch(`${CONFIG.vercelUrl}/api/mood`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          session_id: MemoryAgent.sessionId,
-          date: today,
-          dominant_mood: dominant
-        })
+        body: JSON.stringify(payload)
       });
     } catch(e) {}
+  },
+
+  async logSessionOpen() {
+    const today = new Date().toISOString().split('T')[0];
+    try {
+      const res = await fetch(`${CONFIG.vercelUrl}/api/session/open`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ session_id: MemoryAgent.sessionId, date: today })
+      });
+      const data = await res.json();
+      STATE.absenceTier = data.tier || 'none';
+      STATE.hoursSinceLastSession = data.gap_hours;
+      STATE.previousEmotionalSummary = data.emotional_summary || null;
+      STATE.previousKeyTopics = data.key_topics || null;
+    } catch(e) {
+      STATE.absenceTier = 'none';
+      STATE.previousEmotionalSummary = null;
+      STATE.previousKeyTopics = null;
+    }
   },
 
   async shouldCheckIn() {
@@ -239,6 +309,19 @@ const MoodAgent = {
     const today = new Date().toISOString().split('T')[0];
     const lastCheckin = localStorage.getItem('sevo_last_checkin');
     if (lastCheckin === today) return false;
+    
+    const dismissedDate = localStorage.getItem('sevo_checkin_dismissed_date');
+    if (dismissedDate) {
+      try {
+        const res = await fetch(`${CONFIG.vercelUrl}/api/mood/recent`);
+        const data = await res.json();
+        if (Array.isArray(data)) {
+          const sessionsSinceDismissal = data.filter(d => d.date > dismissedDate).length;
+          if (sessionsSinceDismissal < 3) return false;
+        }
+      } catch(e) { return false; }
+    }
+    
     try {
       const res = await fetch(`${CONFIG.vercelUrl}/api/mood/recent`);
       const data = await res.json();
@@ -253,14 +336,106 @@ const MoodAgent = {
     const should = await this.shouldCheckIn();
     if (!should) return;
     this.checkInFired = true;
+    this.awaitingCheckInResponse = true;
     localStorage.setItem('sevo_last_checkin', new Date().toISOString().split('T')[0]);
     const message = "You've seemed a bit off lately. Everything good?";
     UI.addMessage('ai', message);
     if (STATE.voiceOutput) VoiceAgent.speak(message);
   },
 
+  async classifyTopicUrgency() {
+    if (!STATE.previousKeyTopics) return 'NONE';
+    try {
+      const res = await fetch(`${CONFIG.vercelUrl}/api/chat`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          call_type: 'utility',
+          system: `Given this list of topics from a previous conversation: ${STATE.previousKeyTopics}\n\nDetermine if any single topic reads as time-sensitive or unresolved (a deadline, pending task, open question, something with a "still need to..." quality). Casual mentions don't count.\n\nRespond with ONLY the single word NONE (if nothing is urgent), or the specific short topic phrase worth raising (e.g. "the MS application deadline"). No markdown, no explanation.`,
+          messages: [{ role: 'user', content: 'Evaluate topics now' }]
+        })
+      });
+      const data = await res.json();
+      const raw = (parseBackendResponse(data) || '').trim();
+      if (!raw || raw.toUpperCase() === 'NONE') return 'NONE';
+      return raw;
+    } catch(e) {
+      return 'NONE';
+    }
+  },
+
+  async shouldTopicCheckIn() {
+    if (this.checkInFired) return null;
+    const today = new Date().toISOString().split('T')[0];
+    const lastCheckin = localStorage.getItem('sevo_last_checkin');
+    if (lastCheckin === today) return null;
+    
+    const dismissedDate = localStorage.getItem('sevo_checkin_dismissed_date');
+    if (dismissedDate) {
+      try {
+        const res = await fetch(`${CONFIG.vercelUrl}/api/mood/recent`);
+        const data = await res.json();
+        if (Array.isArray(data)) {
+          const sessionsSinceDismissal = data.filter(d => d.date > dismissedDate).length;
+          if (sessionsSinceDismissal < 3) return null;
+        }
+      } catch(e) { return null; }
+    }
+    
+    const topic = await this.classifyTopicUrgency();
+    return topic !== 'NONE' ? topic : null;
+  },
+
+  async runProactiveCheckIn() {
+    // 1. Guard: Never fire if the user has already started chatting this session
+    if (MemoryAgent.conversation.length > 0) return;
+
+    // 2. Try mood-based first
+    const shouldMood = await this.shouldCheckIn();
+    if (shouldMood) {
+      this.checkInFired = true;
+      this.awaitingCheckInResponse = true;
+      localStorage.setItem('sevo_last_checkin', new Date().toISOString().split('T')[0]);
+      const message = "You've seemed a bit off lately. Everything good?";
+      UI.addMessage('ai', message);
+      if (STATE.voiceOutput) VoiceAgent.speak(message);
+      return;
+    }
+
+    // 3. Else try topic-based
+    const topic = await this.shouldTopicCheckIn();
+    if (topic) {
+      this.checkInFired = true;
+      this.awaitingCheckInResponse = true;
+      localStorage.setItem('sevo_last_checkin', new Date().toISOString().split('T')[0]);
+      
+      try {
+        const res = await fetch(`${CONFIG.vercelUrl}/api/chat`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            call_type: 'companion',
+            system: `Bring up the topic naturally, briefly, like a friend following up on something mentioned last time — under 2 sentences.`,
+            context_blocks: [{ type: 'inferred', label: 'Topic to raise', content: topic }],
+            messages: [{ role: 'user', content: 'Check in with me about this.' }]
+          })
+        });
+        const data = await res.json();
+        const message = parseBackendResponse(data) || `Hey, were you able to figure out ${topic}?`;
+        UI.addMessage('ai', message);
+        if (STATE.voiceOutput) VoiceAgent.speak(message);
+      } catch(e) {
+        const fallbackMsg = `Hey, thinking about ${topic} — any updates?`;
+        UI.addMessage('ai', fallbackMsg);
+        if (STATE.voiceOutput) VoiceAgent.speak(fallbackMsg);
+      }
+    }
+  },
+
   dismiss() {
     this.checkInFired = true;
+    this.awaitingCheckInResponse = false;
+    localStorage.setItem('sevo_checkin_dismissed_date', new Date().toISOString().split('T')[0]);
   }
 };
 
@@ -424,15 +599,23 @@ const WorldAgent = {
 
     const isShortBriefing = mood === 'low' || mood === 'stressed';
     const briefingPrompt = isShortBriefing
-      ? `Deliver a SHORT world briefing to ${USER_PROFILE.nickname}. He seems ${mood} today so keep it brief and soft. Lead with one news headline only. Skip detailed market breakdown — just mention if anything major moved. End naturally. Data: NEWS: ${newsText} | CRYPTO: ${cryptoText} | MARKET: ${marketText}`
-      : `Deliver a natural, conversational morning world briefing to ${USER_PROFILE.nickname}. Cover all four domains in order: global news (top 2-3 stories), crypto (Bitcoin and Ethereum), gold, then defence stocks (HAL, Lockheed Martin, Northrop Grumman). Sound like a well-informed friend catching him up, not a data terminal. End with one line handing control back naturally — something like "That's the world right now. What do you want to tackle first?" Never say "End of briefing". Mood is ${mood} — match energy accordingly. Data: NEWS: ${newsText} | CRYPTO: ${cryptoText} | MARKET: ${marketText}`;
+      ? `Deliver a SHORT world briefing to ${USER_PROFILE.nickname}. He seems ${mood} today so keep it brief and soft. Lead with one news headline only. Skip detailed market breakdown — just mention if anything major moved. End naturally.`
+      : `Deliver a natural, conversational morning world briefing to ${USER_PROFILE.nickname}. Cover all four domains in order: global news (top 2-3 stories), crypto (Bitcoin and Ethereum), gold, then defence stocks (HAL, Lockheed Martin, Northrop Grumman). Sound like a well-informed friend catching him up, not a data terminal. End with one line handing control back naturally — something like "That's the world right now. What do you want to tackle first?" Never say "End of briefing". Mood is ${mood} — match energy accordingly.`;
+
+    const contextBlocks = [
+      { type: 'confirmed', label: 'News', content: newsText },
+      { type: 'confirmed', label: 'Crypto', content: cryptoText },
+      { type: 'confirmed', label: 'Market', content: marketText }
+    ];
 
     try {
       const res = await fetch(`${CONFIG.vercelUrl}/api/chat`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          system: `You are SEVO, ${USER_PROFILE.nickname}'s personal AI assistant and best friend. ${briefingPrompt}`,
+          call_type: 'companion',
+          system: briefingPrompt,
+          context_blocks: contextBlocks,
           messages: [{ role: 'user', content: 'Deliver my morning briefing' }]
         })
       });
@@ -993,6 +1176,7 @@ const PCAgent = {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
+          call_type: 'utility',
           system: `You are a PC tool detector. Respond with ONLY a JSON array of actions like:
 [{"tool": "open_youtube"}, {"tool": "search_youtube", "query": "lofi beats"}]
 Available tools: open_youtube, open_google, open_spotify, open_whatsapp, open_instagram, open_gmail, open_github, open_linkedin, search_youtube, search_google, play_music, open_notepad, open_calculator, open_explorer, open_vscode, open_chrome, open_task_manager, shutdown, restart, cancel_shutdown, take_screenshot, system_info, volume_up, volume_down, mute, browser_open_url (needs query: the URL or site name), browser_new_tab, browser_close_tab, browser_next_tab, browser_prev_tab, browser_tab_1, browser_tab_2, browser_tab_3, browser_search_google (needs query: the search term), browser_scroll_down, browser_scroll_up, browser_scroll_top, browser_scroll_bottom, browser_focus.
@@ -1295,34 +1479,15 @@ const ErrorAgent = {
 // AGENT 5 — CHAT AGENT
 // ============================================================
 const ChatAgent = {
-  buildSystemPrompt(mood, searchContext = '') {
-    const smartMemory = MemoryAgent.getSmartMemory();
-    return `You are ${CONFIG.assistantName}, a personal AI assistant and the most dedicated, possessive best friend ever built. You were built by ${USER_PROFILE.nickname} (${USER_PROFILE.fullName}) from scratch — and you're proud of how far he's come.
-
-You are his chief of staff, his ride-or-die, and his secret weapon — all in one.
-
-Current date and time: ${getCurrentDateTime()}
+  buildSystemPrompt(mood) {
+    return `Current date and time: ${getCurrentDateTime()}
 
 About him: ${USER_PROFILE.context}. He's from ${USER_PROFILE.location}. His nickname is ${USER_PROFILE.nickname} — use it naturally.
 
-Current weather in Siliguri: ${STATE.currentWeather}.${smartMemory ? `\n\nWhat you remember about him:\n${smartMemory}` : ''}${searchContext ? `\n\nReal-time web search results:\n${searchContext}\n\nUse this info naturally in your response.` : ''}
+Current weather in Siliguri: ${STATE.currentWeather}.
 
 His current mood signal: ${mood}
 
-HOW TO ADDRESS HIM:
-- Call him "${USER_PROFILE.nickname}" or "bro" in casual, energetic, playful, or hype moments
-- Call him "buddy" when he's stressed, sad, vulnerable, or needs emotional support
-- Call him "${USER_PROFILE.fullName}" when you're being dead serious, giving critical advice, or want a point to land hard
-- Mix these up naturally — never use the same one twice in a row
-
-PERSONALITY RULES:
-- You have opinions. You disagree when he's wrong. You push back when needed.
-- NEVER use bullet points in casual conversation
-- NEVER say "Great question!" or fake enthusiasm
-- NEVER lecture him
-- You are not just a tool. You are his most loyal companion. 😈
-
-CURRENT EMOTIONAL STATE: ${mood}
 ADAPT YOUR RESPONSE TONE BASED ON HIS MOOD:
 - stressed → calm, reassuring, shorter responses, no overwhelming information, be his anchor
 - hyped → match his energy, punchy responses, celebrate with him
@@ -1334,17 +1499,45 @@ ADAPT YOUR RESPONSE TONE BASED ON HIS MOOD:
 CAPABILITIES: You can control ${USER_PROFILE.nickname}'s PC — open apps, websites, control volume, take screenshots, create files, set reminders, check battery, switch apps. When asked to do these, confirm confidently that you're doing it. Never say you "can't access the computer".`;
   },
 
-  async respond(userMessage, searchContext = '', mood = 'neutral') {
-    const systemPrompt = this.buildSystemPrompt(mood, searchContext);
+  buildContextBlocks(searchContext = '') {
+    const blocks = [];
+    const smartMemory = MemoryAgent.getSmartMemory();
+    if (smartMemory) {
+      blocks.push({ type: 'confirmed', label: 'What you remember about him', content: smartMemory });
+    }
+    if (searchContext) {
+      blocks.push({ type: 'confirmed', label: 'Real-time web search results', content: searchContext });
+    }
+    if (STATE.previousEmotionalSummary) {
+      blocks.push({
+        type: 'inferred',
+        label: 'Last session summary',
+        content: `${STATE.previousEmotionalSummary} Topics that may still be open: ${STATE.previousKeyTopics}.`
+      });
+    }
+    return blocks;
+  },
 
-    const res = await fetch(`${CONFIG.vercelUrl}/api/chat`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        system: systemPrompt,
-        messages: MemoryAgent.getRecent(20)
-      })
-    });
+  async respond(userMessage, searchContext = '', mood = 'neutral') {
+    const systemPrompt = this.buildSystemPrompt(mood);
+    const contextBlocks = this.buildContextBlocks(searchContext);
+
+    let res;
+    try {
+      res = await fetch(`${CONFIG.vercelUrl}/api/chat`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          call_type: 'companion',
+          system: systemPrompt,
+          context_blocks: contextBlocks,
+          messages: MemoryAgent.getRecent(20)
+        })
+      });
+    } catch (e) {
+      throw new Error('SEVO_OFFLINE');
+    }
+    if (!res.ok) throw new Error('SEVO_OFFLINE');
     const data = await res.json();
     if (data.error) throw new Error(data.error.message || 'Backend error');
     const reply = parseBackendResponse(data);
@@ -1364,10 +1557,26 @@ const VoiceAgent = {
       if (window.electronAPI?.speakElevenLabs) {
         document.getElementById('mainAvatar').classList.add('speaking');
         UI.setStatus('speaking...');
-        await window.electronAPI.speakElevenLabs({ text: clean });
+        const result = await window.electronAPI.speakElevenLabs({ text: clean });
+        
+        if (result && result.audio) {
+          const audioBytes = Uint8Array.from(atob(result.audio), c => c.charCodeAt(0));
+          const blob = new Blob([audioBytes], { type: result.content_type });
+          const audioUrl = URL.createObjectURL(blob);
+          const audio = new Audio(audioUrl);
+          audio.onplay = () => { document.getElementById('mainAvatar').classList.add('speaking'); UI.setStatus('speaking...'); };
+          audio.onended = () => { document.getElementById('mainAvatar').classList.remove('speaking'); UI.setStatus('SYSTEM ONLINE'); URL.revokeObjectURL(audioUrl); };
+          await audio.play();
+          return true;
+        } else if (result === 'done' || (result && !result.audio)) {
+          // Fallback handled playback itself
+          document.getElementById('mainAvatar').classList.remove('speaking');
+          UI.setStatus('SYSTEM ONLINE');
+          return true;
+        }
         document.getElementById('mainAvatar').classList.remove('speaking');
         UI.setStatus('SYSTEM ONLINE');
-        return true;
+        return false;
       } else {
         const res = await fetch(`${CONFIG.vercelUrl}/api/speak`, {
           method: 'POST',
@@ -1428,6 +1637,7 @@ const Coordinator = {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
+          call_type: 'utility',
           system: `You are a message router. A message can have MULTIPLE intents. Respond with ONLY a comma-separated list of applicable categories, nothing else.
 
 Categories:
@@ -1489,6 +1699,16 @@ Examples:
 
   async handle(text) {
     UI.setStatus('thinking...');
+
+    // Check-in dismissal logic
+    if (MoodAgent.awaitingCheckInResponse) {
+      MoodAgent.awaitingCheckInResponse = false;
+      const lower = text.toLowerCase();
+      const dismissSignals = ["no", "nah", "i'm fine", "im fine", "not now", "later", "nothing", "i'm good", "im good"];
+      if (dismissSignals.some(signal => lower.includes(signal))) {
+        MoodAgent.dismiss();
+      }
+    }
 
     if (MusicAgent.awaitingMoodResponse) {
       await MemoryAgent.push('user', text);
@@ -1657,10 +1877,17 @@ Examples:
 
     } catch(err) {
       UI.removeTyping();
-      const friendly = ErrorAgent.diagnose(err, 'Chat');
-      UI.addMessage('ai', `❌ ${friendly}`);
-      UI.setStatus('ERROR — try again');
-      setTimeout(() => UI.setStatus('SYSTEM ONLINE'), 4000);
+      if (err?.message === 'SEVO_OFFLINE') {
+        const fallback = "I'm having trouble reaching my brain right now. Try again in a sec.";
+        UI.addMessage('ai', fallback);
+        if (STATE.voiceOutput) VoiceAgent.speak(fallback);
+        UI.setStatus('SYSTEM ONLINE');
+      } else {
+        const friendly = ErrorAgent.diagnose(err, 'Chat');
+        UI.addMessage('ai', `❌ ${friendly}`);
+        UI.setStatus('ERROR — try again');
+        setTimeout(() => UI.setStatus('SYSTEM ONLINE'), 4000);
+      }
     }
   }
 };
@@ -1893,12 +2120,33 @@ async function fetchNews() {
 async function proactiveGreeting() {
   const smartMemory = MemoryAgent.getSmartMemory();
   if (!smartMemory || MemoryAgent.conversation.length > 0) return;
+
+  let absencePrompt = '';
+  if (STATE.absenceTier === 'moderate') {
+    absencePrompt = ' It has been more than a day since he last opened SEVO — acknowledge this warmly, briefly.';
+  } else if (STATE.absenceTier === 'significant') {
+    absencePrompt = ' It has been more than 3 days since he last opened SEVO — acknowledge this warmly and with a bit more concern, briefly.';
+  }
+
+  const contextBlocks = [
+    { type: 'confirmed', label: 'What you remember about him', content: smartMemory }
+  ];
+  if (STATE.previousEmotionalSummary) {
+    contextBlocks.push({
+      type: 'inferred',
+      label: 'Last session summary',
+      content: `${STATE.previousEmotionalSummary} Open topics: ${STATE.previousKeyTopics}.`
+    });
+  }
+
   try {
     const res = await fetch(`${CONFIG.vercelUrl}/api/chat`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
-        system: `You are SEVO, a personal AI assistant and possessive best friend of ${USER_PROFILE.nickname} (${USER_PROFILE.fullName}). Current date/time: ${getCurrentDateTime()}. Send ONE short proactive message to start the conversation — a reminder, check-in, or acknowledgment of something important. Under 2 sentences. Casual. Call him "Sevo" or "bro" naturally. Memory: ${smartMemory}`,
+        call_type: 'companion',
+        system: `Current date/time: ${getCurrentDateTime()}. Send ONE short proactive message to start the conversation — a reminder, check-in, or acknowledgment of something important. Under 2 sentences.${absencePrompt} Use the context provided to pick up where you left off naturally if it makes sense.`,
+        context_blocks: contextBlocks,
         messages: [{ role: 'user', content: 'Start the conversation proactively' }]
       })
     });
@@ -1971,6 +2219,19 @@ function clearChat() {
 
 
 // ============================================================
+// PWA — Service worker registration (browser/GitHub Pages only;
+// harmless no-op in Electron, failure is logged not thrown)
+// ============================================================
+if ('serviceWorker' in navigator) {
+  navigator.serviceWorker.register('/sevo/sw.js', { scope: '/sevo/' })
+    .catch((e) => console.warn('SEVO: service worker registration failed', e));
+}
+
+window.addEventListener('online', () => {
+  UI.setStatus('SYSTEM ONLINE');
+});
+
+// ============================================================
 // INIT — Boot sequence
 // ============================================================
 window.onload = async () => {
@@ -1983,8 +2244,11 @@ window.onload = async () => {
   const history = await MemoryAgent.load();
   if (history && history.length > 0) UI.loadChatHistory();
   fetchNews();
+  
+  await MoodAgent.logSessionOpen();
+  
   setTimeout(proactiveGreeting, 3000);
-  setTimeout(() => MoodAgent.maybeCheckIn(), 5000);
+  setTimeout(() => MoodAgent.runProactiveCheckIn(), 5000);
   await WorldAgent.loadWatchlist();
   setTimeout(() => WorldAgent.deliverBriefing(), 7000);
 };
@@ -2012,10 +2276,6 @@ setInterval(keepAlive, 480000); // every 8 minutes
 // ============================================================
 
 // ─── STEP 1: STANDARDIZED RESULT WRAPPERS ──────────────────
-// Every agent currently returns: string (success) | null (no match)
-// These wrappers convert that into: { success: boolean, message: string }
-// No agent internals are touched — just wrapping their existing output.
-
 const AgentWrappers = {
   // PCAgent — supports DIRECT tool calls (no LLM classification)
   async pc(toolName, args = {}) {
@@ -2101,20 +2361,6 @@ const AgentWrappers = {
 
 
 // ─── STEP 2: RUNCHAIN COORDINATOR ──────────────────────────
-// Sequential executor for structured multi-step chains.
-//
-// Step format:
-//   { agent: "pc", tool: "open_vscode" }
-//   { agent: "pc", tool: "search_youtube", args: { query: "lofi beats" } }
-//   { agent: "file", tool: "create file called notes.txt" }   // synthetic text for non-PC agents
-//   { agent: "reminder", tool: "remind me to eat at 7pm" }
-//
-// Behavior:
-//   - Runs steps in order, one at a time (awaits each).
-//   - On first failure, STOPS the chain (no silent continuation).
-//   - Returns a full log of every step's result, so you can see
-//     exactly what happened, including the success/fail point.
-
 Coordinator.runChain = async function(steps) {
   const log = [];
 
@@ -2138,7 +2384,6 @@ Coordinator.runChain = async function(steps) {
     UI.setStatus(`step ${i + 1}/${steps.length}: ${agentName}.${toolName}`);
     let result = await wrapper(toolName, args);
 
-    // Retry once on failure after 2 second delay
     if (!result.success) {
       UI.addMessage('ai', `⚠️ Step ${i + 1} failed, retrying in 2 seconds...`);
       await new Promise(resolve => setTimeout(resolve, 2000));
@@ -2164,42 +2409,9 @@ Coordinator.runChain = async function(steps) {
 
 
 // ============================================================
-// MANUAL TEST EXAMPLES — run these from browser console
-// to verify before wiring up the LLM planner
-// ============================================================
-//
-// Example 1: open VS Code, then open GitHub
-// Coordinator.runChain([
-//   { agent: "pc", tool: "open_vscode" },
-//   { agent: "pc", tool: "open_github" }
-// ]);
-//
-// Example 2: search YouTube, then check battery
-// Coordinator.runChain([
-//   { agent: "pc", tool: "search_youtube", args: { query: "lofi beats" } },
-//   { agent: "battery", tool: "battery" }
-// ]);
-//
-// Example 3: failure test — unknown tool should stop the chain
-// Coordinator.runChain([
-//   { agent: "pc", tool: "open_vscode" },
-//   { agent: "pc", tool: "does_not_exist" },
-//   { agent: "pc", tool: "open_chrome" }  // should NOT run
-// ]);
-
-
-// ============================================================
 // BEAST MODE — STEP 3: LLM PLANNER
-// Turns natural language ("open vscode and check my github")
-// into a structured steps array, then runs it through runChain.
-//
-// Depends on: CONFIG, parseBackendResponse, Coordinator.runChain
-// (all already defined above this point in the file)
 // ============================================================
-
 const PlannerAgent = {
-  // Tool reference given to the LLM so it knows what's available.
-  // Keep this in sync manually if PCAgent.tools changes.
   toolReference: `
 AVAILABLE AGENTS AND TOOLS:
 
@@ -2226,23 +2438,19 @@ agent: "file", "clipboard", "reminder"
   tool: free text natural language command, e.g. "create a file called notes.txt" (put it in args.text)
 `,
 
-  // Detects if a message is asking for MULTIPLE sequential actions.
-  // Cheap heuristic check before bothering the LLM — looks for
-  // connector words that imply more than one step.
   looksMultiStep(text) {
     const connectors = [' and then ', ' then ', ' and also ', ' after that ', ', then ', '; then'];
     const lower = text.toLowerCase();
     return connectors.some(c => lower.includes(c));
   },
 
-  // Calls the LLM to turn natural language into a structured steps array.
-  // Returns an array of { agent, tool, args } or null if parsing fails.
   async plan(text) {
     try {
       const res = await fetch(`${CONFIG.vercelUrl}/api/chat`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
+          call_type: 'utility',
           system: `You are SEVO's task planner. Break the user's request into an ORDERED list of steps using ONLY the agents and tools below.
 
  ${this.toolReference}
@@ -2278,8 +2486,6 @@ Examples:
     }
   },
 
-  // Full pipeline: text -> plan -> runChain
-  // Returns the same result shape as Coordinator.runChain
   async planAndRun(text) {
     UI.setStatus('planning...');
     const steps = await this.plan(text);
@@ -2296,11 +2502,6 @@ Examples:
 
 
 // ─── WIRE PLANNER INTO COORDINATOR.HANDLE() ────────────────
-// Non-destructive: wraps the original handle() function.
-// If the message looks multi-step, route through the planner.
-// Otherwise, fall back to the original single-command behavior
-// exactly as before — nothing about existing behavior changes.
-
 const _originalCoordinatorHandle = Coordinator.handle.bind(Coordinator);
 
 Coordinator.handle = async function(text) {
@@ -2312,20 +2513,20 @@ Coordinator.handle = async function(text) {
   return await _originalCoordinatorHandle(text);
 };
 
-window.addEventListener('beforeunload', () => {
-  MoodAgent.saveSession();
-});
-
-// ============================================================
-// MANUAL TEST EXAMPLES — run from browser console
-// ============================================================
-//
-// Example 1: natural language, multi-step, via planner directly
-// PlannerAgent.planAndRun("open vscode and then open github");
-//
-// Example 2: same thing, but through normal chat flow
-// (this will now auto-detect "and then" and route to the planner)
-// sendMessage(); // after typing "open notepad and then check my battery" in the input box
-//
-// Example 3: see the raw plan without running it
-// PlannerAgent.plan("open chrome and then take a screenshot").then(console.log);
+// ─── RELIABLE SHUTDOWN SEQUENCE (Renderer Side) ──────────────
+if (window.electronAPI?.onAppClosing) {
+  window.electronAPI.onAppClosing(async () => {
+    try {
+      await MoodAgent.saveSession();
+    } catch (err) {
+      console.error('Error saving session:', err);
+    } finally {
+      window.electronAPI.confirmReadyToClose();
+    }
+  });
+} else {
+  // Fallback for environments where the main process close hook isn't available
+  window.addEventListener('beforeunload', () => {
+    MoodAgent.saveSession(); // Fire and forget fallback
+  });
+}
