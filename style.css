@@ -772,4 +772,24 @@ body::before {
   font-size: 13px;
   text-shadow: 0 0 6px var(--accent);
   cursor: pointer;
+  z-index: 1;
+}
+
+.yt-close-btn {
+  position: absolute;
+  top: 4px;
+  right: 4px;
+  width: 22px;
+  height: 22px;
+  border-radius: 4px;
+  border: 1px solid var(--accent);
+  background: #050508cc;
+  color: var(--accent);
+  font-size: 12px;
+  line-height: 1;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  z-index: 2;
 }
