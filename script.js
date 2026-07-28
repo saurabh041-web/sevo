@@ -809,6 +809,135 @@ const EmailAgent = {
 
 
 // ============================================================
+// YT PLAYER AGENT — YouTube IFrame Player API (mobile only)
+// Mobile has no OS-level automation channel the way desktop's
+// PCAgent/SendKeys path does, so playback is controlled directly
+// through YouTube's own JS player methods instead.
+// ============================================================
+const YTPlayerAgent = {
+  player: null,
+  apiReadyPromise: null,
+  currentVolume: 70,
+
+  loadApi() {
+    if (this.apiReadyPromise) return this.apiReadyPromise;
+    this.apiReadyPromise = new Promise((resolve) => {
+      if (window.YT && window.YT.Player) { resolve(); return; }
+      window.onYouTubeIframeAPIReady = resolve;
+      const tag = document.createElement('script');
+      tag.src = 'https://www.youtube.com/iframe_api';
+      document.head.appendChild(tag);
+    });
+    return this.apiReadyPromise;
+  },
+
+  async ensurePlayer() {
+    await this.loadApi();
+    if (this.player) return this.player;
+    return new Promise((resolve) => {
+      this.player = new YT.Player('ytPlayerFrame', {
+        height: '220',
+        width: '220',
+        playerVars: { enablejsapi: 1, playsinline: 1, controls: 1 },
+        events: {
+          onReady: () => resolve(this.player),
+          onError: (e) => this.handleError(e)
+        }
+      });
+    });
+  },
+
+  handleError(e) {
+    // 101/150 = video owner has disabled embedded playback — muting won't
+    // help here, it's a different failure mode than an autoplay block.
+    const restricted = [101, 150].includes(e.data);
+    const msg = restricted
+      ? "That track's blocked from playing embedded — probably the artist's call. Want me to try another one?"
+      : "Had trouble loading that track. Try again in a sec?";
+    UI.addMessage('ai', msg);
+  },
+
+  showWidget() {
+    const el = document.getElementById('ytPlayerWidget');
+    if (el) el.style.display = 'block';
+  },
+
+  showUnmuteOverlay() {
+    const btn = document.getElementById('ytUnmuteBtn');
+    if (btn) btn.style.display = 'flex';
+  },
+
+  hideUnmuteOverlay() {
+    const btn = document.getElementById('ytUnmuteBtn');
+    if (btn) btn.style.display = 'none';
+  },
+
+  unmute() {
+    if (!this.player) return;
+    this.player.unMute();
+    this.player.setVolume(this.currentVolume);
+    this.hideUnmuteOverlay();
+  },
+
+  async loadTrack(videoId) {
+    await this.ensurePlayer();
+    this.showWidget();
+    this.hideUnmuteOverlay();
+    this.player.unMute();
+    this.player.setVolume(this.currentVolume);
+    this.player.loadVideoById(videoId);
+
+    // Mobile browsers block unmuted autoplay unless the play() call chains
+    // directly off a user gesture — by the time the chat round-trip finishes,
+    // that chain is broken. Check shortly after whether playback actually
+    // started; if not, fall back to muted autoplay + a tap-to-unmute prompt.
+    setTimeout(() => {
+      if (!this.player) return;
+      const state = this.player.getPlayerState();
+      const started = state === YT.PlayerState.PLAYING || state === YT.PlayerState.BUFFERING;
+      if (!started) {
+        this.player.mute();
+        this.player.playVideo();
+        this.showUnmuteOverlay();
+        UI.addMessage('ai', "Looks like your phone's blocking autoplay — tap the player to unmute 🔇");
+      }
+    }, 1400);
+  },
+
+  async pause() {
+    await this.ensurePlayer();
+    this.player.pauseVideo();
+  },
+
+  async resume() {
+    await this.ensurePlayer();
+    this.player.playVideo();
+  },
+
+  async stop() {
+    if (!this.player) return;
+    this.player.stopVideo();
+    const el = document.getElementById('ytPlayerWidget');
+    if (el) el.style.display = 'none';
+    this.hideUnmuteOverlay();
+  },
+
+  async setVolumeDelta(delta) {
+    await this.ensurePlayer();
+    const current = this.player.getVolume?.() ?? this.currentVolume;
+    this.currentVolume = Math.max(0, Math.min(100, current + delta));
+    this.player.setVolume(this.currentVolume);
+    if (this.player.isMuted()) this.player.unMute();
+  },
+
+  async mute() {
+    await this.ensurePlayer();
+    this.player.mute();
+  }
+};
+
+
+// ============================================================
 // MUSIC AGENT — YouTube Music Control
 // ============================================================
 const MusicAgent = {
@@ -833,7 +962,16 @@ const MusicAgent = {
     if (lower === 'resume' || lower === 'resume music' || lower === 'play') {
       return await this.resume();
     }
-    
+    if (isMobileDevice() && (lower.includes('volume up') || lower.includes('louder'))) {
+      return await this.volumeUp();
+    }
+    if (isMobileDevice() && (lower.includes('volume down') || lower.includes('quieter'))) {
+      return await this.volumeDown();
+    }
+    if (isMobileDevice() && lower.includes('mute') && !lower.includes('unmute')) {
+      return await this.muteTrack();
+    }
+
     if (lower.startsWith('play')) {
       let query = text.replace(/^play\s+/i, '').trim();
       
@@ -866,7 +1004,7 @@ const MusicAgent = {
 
   async play(query) {
     try {
-      if (this.queue.hasTabOpen) {
+      if (!isMobileDevice() && this.queue.hasTabOpen) {
         await PCAgent.tools.browser_focus();
         await PCAgent.tools.browser_close_tab();
       }
@@ -884,10 +1022,14 @@ const MusicAgent = {
         url: `https://www.youtube.com/watch?v=${video.id.videoId}`
       }));
       this.queue.currentIndex = 0;
-      
+
       const current = this.queue.results[0];
-      await PCAgent.tools.browser_open_url(current.url);
-      this.queue.hasTabOpen = true;
+      if (isMobileDevice()) {
+        await YTPlayerAgent.loadTrack(current.videoId);
+      } else {
+        await PCAgent.tools.browser_open_url(current.url);
+        this.queue.hasTabOpen = true;
+      }
 
       return `Playing ${current.title} 🎵`;
     } catch (e) {
@@ -901,6 +1043,11 @@ const MusicAgent = {
   },
 
   async pause() {
+    if (isMobileDevice()) {
+      if (this.queue.currentIndex === -1) return "Nothing is playing right now, buddy.";
+      await YTPlayerAgent.pause();
+      return 'Paused ⏸️';
+    }
     if (!this.queue.hasTabOpen) {
       return "Nothing is playing right now, buddy. You might need to pause it manually if a tab is open.";
     }
@@ -913,6 +1060,11 @@ const MusicAgent = {
   },
 
   async resume() {
+    if (isMobileDevice()) {
+      if (this.queue.currentIndex === -1) return "Nothing is playing right now, buddy.";
+      await YTPlayerAgent.resume();
+      return 'Resumed ▶️';
+    }
     if (!this.queue.hasTabOpen) {
       return "Nothing is playing right now, buddy.";
     }
@@ -924,9 +1076,33 @@ const MusicAgent = {
     }
   },
 
+  async volumeUp() {
+    if (this.queue.currentIndex === -1) return "Nothing's playing to adjust, buddy.";
+    await YTPlayerAgent.setVolumeDelta(10);
+    return 'Volume up 🔊';
+  },
+
+  async volumeDown() {
+    if (this.queue.currentIndex === -1) return "Nothing's playing to adjust, buddy.";
+    await YTPlayerAgent.setVolumeDelta(-10);
+    return 'Volume down 🔉';
+  },
+
+  async muteTrack() {
+    if (this.queue.currentIndex === -1) return "Nothing's playing to mute, buddy.";
+    await YTPlayerAgent.mute();
+    return 'Muted 🔇';
+  },
+
   async skip() {
     if (this.queue.currentIndex + 1 >= this.queue.results.length) {
       return "That was the last one in the queue. Want me to find something else?";
+    }
+    if (isMobileDevice()) {
+      this.queue.currentIndex++;
+      const current = this.queue.results[this.queue.currentIndex];
+      await YTPlayerAgent.loadTrack(current.videoId);
+      return `Next up: ${current.title} ⏭️`;
     }
     try {
       await PCAgent.tools.browser_focus();
@@ -951,6 +1127,11 @@ const MusicAgent = {
   },
 
   async stop() {
+    if (isMobileDevice()) {
+      await YTPlayerAgent.stop();
+      this.queue = { results: [], currentIndex: -1, hasTabOpen: false };
+      return 'Music stopped 🔇';
+    }
     if (this.queue.hasTabOpen) {
       await PCAgent.tools.browser_focus();
       await PCAgent.tools.browser_close_tab();
@@ -1969,7 +2150,16 @@ const UI = {
 // ============================================================
 // WAKE WORD + VOICE INPUT
 // ============================================================
+function isMobileDevice() {
+  return /Android|iPhone|iPad|iPod/i.test(navigator.userAgent);
+}
+
 function startWakeWord() {
+  // Wake word is not available on mobile in this phase (PRD, Phase 6) — mobile
+  // Chrome ends `continuous` SpeechRecognition sessions far more aggressively
+  // than desktop, which turned the onend auto-restart below into a rapid
+  // start/stop loop (mic indicator flicker + notification sound, see P0 fix).
+  if (isMobileDevice()) return;
   if (!('webkitSpeechRecognition' in window) && !('SpeechRecognition' in window)) return;
   const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
   STATE.wakeWordRecognition = new SpeechRecognition();
@@ -2020,19 +2210,28 @@ function playWakeSound() {
   } catch(e) {}
 }
 
+function resetRecordingUI() {
+  STATE.isRecording = false;
+  document.getElementById('voiceBtn').classList.remove('recording');
+  document.getElementById('voiceBtn').textContent = '🎤';
+  UI.setStatus('SYSTEM ONLINE');
+}
+
 function toggleVoice() {
   if (!('webkitSpeechRecognition' in window) && !('SpeechRecognition' in window)) {
     alert('Voice input not supported! Use Chrome browser.');
     return;
   }
-  if (STATE.isRecording) { STATE.recognition.stop(); return; }
+  if (STATE.isRecording) { STATE.recognition?.stop(); return; }
+  // Set synchronously (not in onstart) so a fast double-tap before onstart
+  // fires can't slip past this guard and spin up a second concurrent session.
+  STATE.isRecording = true;
   const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
   STATE.recognition = new SpeechRecognition();
   STATE.recognition.lang = 'en-IN';
   STATE.recognition.continuous = false;
   STATE.recognition.interimResults = false;
   STATE.recognition.onstart = () => {
-    STATE.isRecording = true;
     document.getElementById('voiceBtn').classList.add('recording');
     document.getElementById('voiceBtn').textContent = '⏹️';
     UI.setStatus('listening...');
@@ -2043,12 +2242,8 @@ function toggleVoice() {
     autoResize(document.getElementById('userInput'));
     sendMessage();
   };
-  STATE.recognition.onend = () => {
-    STATE.isRecording = false;
-    document.getElementById('voiceBtn').classList.remove('recording');
-    document.getElementById('voiceBtn').textContent = '🎤';
-    UI.setStatus('SYSTEM ONLINE');
-  };
+  STATE.recognition.onerror = () => resetRecordingUI();
+  STATE.recognition.onend = () => resetRecordingUI();
   STATE.recognition.start();
 }
 
