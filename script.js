@@ -2154,6 +2154,11 @@ function isMobileDevice() {
   return /Android|iPhone|iPad|iPod/i.test(navigator.userAgent);
 }
 
+// Scopes mobile-only CSS (touch targets, keyboard-aware viewport) without
+// relying on width-based media queries, which could misfire on a resized
+// Electron desktop window. Runs synchronously before first paint.
+if (isMobileDevice()) document.body.classList.add('is-mobile');
+
 function startWakeWord() {
   // Wake word is not available on mobile in this phase (PRD, Phase 6) — mobile
   // Chrome ends `continuous` SpeechRecognition sessions far more aggressively

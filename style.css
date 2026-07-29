@@ -793,3 +793,23 @@ body::before {
   cursor: pointer;
   z-index: 2;
 }
+
+/* ─── MOBILE RESPONSIVE PASS (touch targets, keyboard-aware, overflow-safe) ─── */
+body.is-mobile {
+  height: 100dvh; /* keeps the footer pinned above the on-screen keyboard */
+}
+
+body.is-mobile .action-btn,
+body.is-mobile .icon-btn {
+  min-width: 44px;
+  min-height: 44px;
+}
+
+body.is-mobile #userInput {
+  min-height: 44px;
+}
+
+body.is-mobile .bubble {
+  overflow-wrap: break-word;
+  word-break: break-word;
+}
