@@ -10,6 +10,7 @@
 <link rel="stylesheet" href="style.css">
 <link rel="manifest" href="manifest.json">
 <meta name="theme-color" content="#00b4d8">
+<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
 </head>
 <body>
 
@@ -17,10 +18,56 @@
   <div class="setup-card">
     <div class="big-icon">⚡</div>
     <h2>SEVO SYSTEM</h2>
-    <p>Authorization required. Enter your Groq API key to initialize the system.</p>
-    <input type="password" class="setup-input" id="apiKeyInput" placeholder="// paste authorization key..." />
-    <input type="text" class="setup-input" id="assistantName" placeholder="// assign system name... (e.g. SEVO)" />
-    <button class="setup-btn" onclick="saveSetup()">INITIALIZE SYSTEM ⚡</button>
+    <div id="authMessage" class="auth-message" style="display:none;"></div>
+
+    <div id="authPanelSignin" class="auth-panel">
+      <p>Sign in to continue.</p>
+      <input type="email" class="setup-input" id="signinEmail" placeholder="// email" autocomplete="username" />
+      <div class="password-field">
+        <input type="password" class="setup-input" id="signinPassword" placeholder="// password" autocomplete="current-password" />
+        <button type="button" class="password-toggle" onclick="AuthUI.togglePasswordVisibility('signinPassword', this)" title="Show password">👁</button>
+      </div>
+      <button class="setup-btn" onclick="AuthUI.handleSignIn()">SIGN IN ⚡</button>
+      <div class="auth-links">
+        <a href="#" onclick="AuthUI.showPanel('forgot'); return false;">Forgot password?</a>
+        <a href="#" onclick="AuthUI.showPanel('signup'); return false;">Need an account? Sign up</a>
+      </div>
+    </div>
+
+    <div id="authPanelSignup" class="auth-panel" style="display:none;">
+      <p>Create an account.</p>
+      <input type="email" class="setup-input" id="signupEmail" placeholder="// email" autocomplete="username" />
+      <div class="password-field">
+        <input type="password" class="setup-input" id="signupPassword" placeholder="// password (min 6 characters)" autocomplete="new-password" />
+        <button type="button" class="password-toggle" onclick="AuthUI.togglePasswordVisibility('signupPassword', this)" title="Show password">👁</button>
+      </div>
+      <button class="setup-btn" onclick="AuthUI.handleSignUp()">CREATE ACCOUNT ⚡</button>
+      <div class="auth-links">
+        <a href="#" onclick="AuthUI.showPanel('signin'); return false;">Already have an account? Sign in</a>
+      </div>
+    </div>
+
+    <div id="authPanelForgot" class="auth-panel" style="display:none;">
+      <p>Enter your email — we'll send a reset link.</p>
+      <input type="email" class="setup-input" id="forgotEmail" placeholder="// email" autocomplete="username" />
+      <button class="setup-btn" onclick="AuthUI.handleForgotPassword()">SEND RESET LINK ⚡</button>
+      <div class="auth-links">
+        <a href="#" onclick="AuthUI.showPanel('signin'); return false;">Back to sign in</a>
+      </div>
+    </div>
+
+    <div id="authPanelReset" class="auth-panel" style="display:none;">
+      <p>Set a new password.</p>
+      <div class="password-field">
+        <input type="password" class="setup-input" id="resetPassword" placeholder="// new password (min 6 characters)" autocomplete="new-password" />
+        <button type="button" class="password-toggle" onclick="AuthUI.togglePasswordVisibility('resetPassword', this)" title="Show password">👁</button>
+      </div>
+      <div class="password-field">
+        <input type="password" class="setup-input" id="resetPasswordConfirm" placeholder="// confirm new password" autocomplete="new-password" />
+        <button type="button" class="password-toggle" onclick="AuthUI.togglePasswordVisibility('resetPasswordConfirm', this)" title="Show password">👁</button>
+      </div>
+      <button class="setup-btn" onclick="AuthUI.handleSetNewPassword()">SET PASSWORD ⚡</button>
+    </div>
   </div>
 </div>
 
@@ -55,6 +102,7 @@
     <div id="weatherWidget" class="weather-widget">🌡️ --°C</div>
     <button class="icon-btn" onclick="toggleVoiceOutput()" id="speakerBtn" title="Toggle voice">🔊</button>
     <button class="icon-btn" onclick="clearChat()" title="Clear">🗑️</button>
+    <button class="icon-btn" onclick="AuthUI.logout()" title="Log out">🚪</button>
     <button class="icon-btn" onclick="resetSetup()" title="Settings">⚙️</button>
   </div>
 </header>

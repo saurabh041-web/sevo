@@ -13,6 +13,15 @@ const CONFIG = {
   elevenLabsVoice: '21m00Tcm4TlvDq8ikWAM',
   city: 'Siliguri',
   groqModel: 'llama-3.3-70b-versatile',
+  supabaseUrl: 'https://rwursqisimkcwdwvcbdw.supabase.co',
+  supabaseAnonKey: 'sb_publishable_0tTcZ9epPdBuuhG3iQmRTA_42UgVydP',
+  // FLAG: password-reset emails link back to this fixed URL regardless of
+  // which platform (PWA or Electron) requested the reset, since the email
+  // is always opened in a real browser. Must be confirmed as the actual
+  // live GitHub Pages URL before password reset works correctly in
+  // production — this session surfaced real ambiguity between
+  // saurabh0198.github.io/sevo and saurabh041-web.github.io/sevo.
+  appUrl: 'https://saurabh041-web.github.io/sevo/',
 };
 
 const USER_PROFILE = {
@@ -39,6 +48,152 @@ const STATE = {
   hoursSinceLastSession: null,
   previousEmotionalSummary: null,
   previousKeyTopics: null,
+};
+
+// ============================================================
+// AUTH AGENT — Supabase Auth (direct client-side, standard pattern)
+// Phase 7 Spec 2. Nothing else in this app talks to Supabase directly
+// (everything else proxies through the Render backend) — Auth is the
+// one deliberate exception, since that's Supabase's own designed
+// pattern and the anon/publishable key is safe to expose client-side.
+// ============================================================
+const AuthAgent = {
+  client: null,
+  session: null,
+
+  init() {
+    this.client = window.supabase.createClient(CONFIG.supabaseUrl, CONFIG.supabaseAnonKey);
+    this.client.auth.onAuthStateChange((event, session) => {
+      this.session = session;
+      if (event === 'PASSWORD_RECOVERY') {
+        AuthUI.showPanel('reset');
+      }
+    });
+  },
+
+  async getSession() {
+    const { data } = await this.client.auth.getSession();
+    this.session = data.session;
+    return this.session;
+  },
+
+  async signUp(email, password) {
+    return await this.client.auth.signUp({ email, password });
+  },
+
+  async signIn(email, password) {
+    return await this.client.auth.signInWithPassword({ email, password });
+  },
+
+  async signOut() {
+    return await this.client.auth.signOut();
+  },
+
+  async resetPassword(email) {
+    return await this.client.auth.resetPasswordForEmail(email, { redirectTo: CONFIG.appUrl });
+  },
+
+  async updatePassword(newPassword) {
+    return await this.client.auth.updateUser({ password: newPassword });
+  }
+};
+
+// ============================================================
+// AUTH UI — signup/login/reset panel handling
+// Repurposes the #setup overlay, which was already the app's
+// full-screen ice-blue shell but had been fully dead code on master
+// (the old "enter your Groq API key" flow, unconditionally hidden
+// every boot since the switch to the backend proxy).
+// ============================================================
+const AuthUI = {
+  showPanel(name) {
+    document.getElementById('setup').style.display = 'flex';
+    ['signin', 'signup', 'forgot', 'reset'].forEach((p) => {
+      document.getElementById(`authPanel${p.charAt(0).toUpperCase()}${p.slice(1)}`).style.display = p === name ? 'block' : 'none';
+    });
+    this.clearMessage();
+  },
+
+  showMessage(text, type = 'error') {
+    const el = document.getElementById('authMessage');
+    el.textContent = text;
+    el.className = `auth-message ${type}`;
+    el.style.display = 'block';
+  },
+
+  clearMessage() {
+    const el = document.getElementById('authMessage');
+    el.style.display = 'none';
+    el.textContent = '';
+  },
+
+  async handleSignIn() {
+    const email = document.getElementById('signinEmail').value.trim();
+    const password = document.getElementById('signinPassword').value;
+    if (!email || !password) return this.showMessage('Enter your email and password.');
+
+    const { data, error } = await AuthAgent.signIn(email, password);
+    if (error) return this.showMessage(error.message);
+
+    document.getElementById('setup').style.display = 'none';
+    await bootApp();
+  },
+
+  async handleSignUp() {
+    const email = document.getElementById('signupEmail').value.trim();
+    const password = document.getElementById('signupPassword').value;
+    if (!email || !password) return this.showMessage('Enter an email and password.');
+    if (password.length < 6) return this.showMessage('Password must be at least 6 characters.');
+
+    const { data, error } = await AuthAgent.signUp(email, password);
+    if (error) return this.showMessage(error.message);
+
+    if (data.session) {
+      // Email confirmation is disabled on this project — signup logs in immediately
+      document.getElementById('setup').style.display = 'none';
+      await bootApp();
+      return;
+    }
+    // Email confirmation is enabled — no session yet, user must confirm first
+    this.showPanel('signin');
+    this.showMessage('Account created. Check your email to confirm, then sign in.', 'success');
+  },
+
+  async handleForgotPassword() {
+    const email = document.getElementById('forgotEmail').value.trim();
+    if (!email) return this.showMessage('Enter your email.');
+
+    const { error } = await AuthAgent.resetPassword(email);
+    if (error) return this.showMessage(error.message);
+
+    this.showMessage('Reset link sent — check your email.', 'success');
+  },
+
+  async handleSetNewPassword() {
+    const password = document.getElementById('resetPassword').value;
+    const confirm = document.getElementById('resetPasswordConfirm').value;
+    if (!password || password.length < 6) return this.showMessage('Password must be at least 6 characters.');
+    if (password !== confirm) return this.showMessage('Passwords do not match.');
+
+    const { error } = await AuthAgent.updatePassword(password);
+    if (error) return this.showMessage(error.message);
+
+    document.getElementById('setup').style.display = 'none';
+    await bootApp();
+  },
+
+  async logout() {
+    await AuthAgent.signOut();
+    location.reload();
+  },
+
+  togglePasswordVisibility(inputId, btn) {
+    const input = document.getElementById(inputId);
+    const isHidden = input.type === 'password';
+    input.type = isHidden ? 'text' : 'password';
+    btn.textContent = isHidden ? '🙈' : '👁';
+    btn.title = isHidden ? 'Hide password' : 'Show password';
+  }
 };
 
 // ─── UTILS ──────────────────────────────────────────────────
@@ -2366,20 +2521,6 @@ function autoResize(el) { el.style.height = 'auto'; el.style.height = Math.min(e
 function handleKey(e) { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); sendMessage(); } }
 function sendSuggestion(el) { document.getElementById('userInput').value = el.textContent; sendMessage(); }
 
-function saveSetup() {
-  const name = document.getElementById('assistantName')?.value.trim();
-  if (name) {
-    CONFIG.assistantName = name;
-    localStorage.setItem('assistant_name', name);
-  }
-  hideSetup();
-  updateAssistantName();
-  fetchNews();
-  startWakeWord();
-  setTimeout(proactiveGreeting, 3000);
-}
-
-function hideSetup() { document.getElementById('setup').style.display = 'none'; updateAssistantName(); }
 function resetSetup() { localStorage.clear(); location.reload(); }
 
 function updateAssistantName() {
@@ -2434,8 +2575,7 @@ window.addEventListener('online', () => {
 // ============================================================
 // INIT — Boot sequence
 // ============================================================
-window.onload = async () => {
-  hideSetup();
+async function bootApp() {
   updateAssistantName();
   startWakeWord();
   fetchWeather();
@@ -2444,13 +2584,24 @@ window.onload = async () => {
   const history = await MemoryAgent.load();
   if (history && history.length > 0) UI.loadChatHistory();
   fetchNews();
-  
+
   await MoodAgent.logSessionOpen();
-  
+
   setTimeout(proactiveGreeting, 3000);
   setTimeout(() => MoodAgent.runProactiveCheckIn(), 5000);
   await WorldAgent.loadWatchlist();
   setTimeout(() => WorldAgent.deliverBriefing(), 7000);
+}
+
+window.onload = async () => {
+  AuthAgent.init();
+  const session = await AuthAgent.getSession();
+  if (session) {
+    document.getElementById('setup').style.display = 'none';
+    await bootApp();
+  } else {
+    AuthUI.showPanel('signin');
+  }
 };
 
 if (window.speechSynthesis) { window.speechSynthesis.onvoiceschanged = () => window.speechSynthesis.getVoices(); }

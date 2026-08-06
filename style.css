@@ -813,3 +813,85 @@ body.is-mobile .bubble {
   overflow-wrap: break-word;
   word-break: break-word;
 }
+
+/* ─── AUTH (login/signup/reset) ──────────────────────────────
+   Reuses .setup-card/.setup-input/.setup-btn — this whole overlay
+   was already the app's ice-blue full-screen shell, just previously
+   dormant behind a dead pre-auth setup flow. */
+.auth-panel p {
+  color: var(--muted);
+  font-size: 11px;
+  margin-bottom: 16px;
+  line-height: 1.6;
+  letter-spacing: 0.5px;
+}
+
+.auth-links {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin-top: 14px;
+  font-size: 10px;
+}
+
+.auth-links a {
+  color: var(--accent);
+  text-decoration: none;
+  letter-spacing: 0.3px;
+  transition: opacity 0.2s;
+}
+
+.auth-links a:hover {
+  opacity: 0.75;
+  text-decoration: underline;
+}
+
+.auth-message {
+  border-radius: 3px;
+  padding: 10px 12px;
+  font-size: 11px;
+  line-height: 1.5;
+  margin-bottom: 16px;
+  letter-spacing: 0.3px;
+  text-align: left;
+}
+
+.auth-message.error {
+  border: 1px solid var(--red);
+  color: var(--red);
+  background: #ff406010;
+}
+
+.auth-message.success {
+  border: 1px solid var(--green);
+  color: var(--green);
+  background: #00f5a010;
+}
+
+.password-field {
+  position: relative;
+}
+
+.password-field .setup-input {
+  padding-right: 40px;
+}
+
+.password-toggle {
+  position: absolute;
+  right: 6px;
+  top: 0;
+  bottom: 10px; /* matches .setup-input's own margin-bottom, keeps toggle vertically centered on the input, not the margin below it */
+  display: flex;
+  align-items: center;
+  background: transparent;
+  border: none;
+  color: var(--muted);
+  font-size: 14px;
+  line-height: 1;
+  cursor: pointer;
+  padding: 0 6px;
+}
+
+.password-toggle:hover {
+  color: var(--accent);
+}
